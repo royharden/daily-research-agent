@@ -1,9 +1,10 @@
 # Morning Brief — edge function config
-# Both functions are public in this demo (no auth): verify_jwt = false so the
-# frontend's anon key and pg_net cron calls work without a user session.
+# verify_jwt is enabled on all functions. The frontend calls via
+# supabase.functions.invoke (which sends the anon key as Authorization
+# and apikey headers). pg_cron jobs send the same headers from app_config.
 
 [functions.run-skill]
-verify_jwt = false
+verify_jwt = true
 
 [functions.write-digest]
-verify_jwt = false
+verify_jwt = true

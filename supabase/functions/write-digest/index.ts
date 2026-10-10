@@ -1,4 +1,5 @@
 // write-digest: LLM summarizes kept items into a published digest.
+// verify_jwt = true — called by run-skill via the service-role client which sends auth headers.
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import { corsHeaders, json, DAILY_CAP, truncate, sanitizeUntrusted, nowIso } from "../_shared/deno-utils.ts";
 

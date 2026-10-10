@@ -1,4 +1,5 @@
 // run-skill: fetch sources -> dedupe -> Jev (batched) -> rank -> call write-digest.
+// verify_jwt = true — callers must send the anon key (frontend via supabase.functions.invoke, cron via Authorization header).
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import {
   corsHeaders,
