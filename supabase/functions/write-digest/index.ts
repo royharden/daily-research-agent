@@ -26,11 +26,14 @@ function authorize(_req: Request): void {
   // and the read-only, SSRF-guarded fetcher.
 }
 
-async function tryIncrementUsage(): Promise<boolean> {
+type UsageResult = { ok: true } | { over_cap: true } | { error: string };
+
+async function tryIncrementUsage(): Promise<UsageResult> {
   const db = svc();
   const { data, error } = await db.rpc("increment_usage", { fn_name: "write-digest" });
-  if (error) return false;
-  return data !== -1;
+  if (error) return { error: error.message };
+  if (data === -1) return { over_cap: true };
+  return { ok: true };
 }
 
 function mockDigest(skillName: string, items: DigestItem[]): DigestContent {
@@ -113,9 +116,12 @@ Deno.serve(async (req: Request) => {
     authorize(req);
     if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
-    const allowed = await tryIncrementUsage();
-    if (!allowed) {
-      return json({ error: "Demo daily limit reached — showing the last digest", code: "daily_limit" }, 429);
+    const usage = await tryIncrementUsage();
+    if ("error" in usage) {
+      return json({ error: "Usage counter unavailable — cannot proceed safely" }, 503);
+    }
+    if ("over_cap" in usage) {
+      return json({ error: "Demo daily limit reached - Offline demo still works", code: "daily_limit" }, 429);
     }
 
     const body = await req.json();

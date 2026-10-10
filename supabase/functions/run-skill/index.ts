@@ -29,14 +29,17 @@ function authorize(_req: Request): void {
   // and the read-only, SSRF-guarded fetcher.
 }
 
-async function tryIncrementUsage(fn: string): Promise<boolean> {
+type UsageResult = { ok: true } | { over_cap: true } | { error: string };
+
+async function tryIncrementUsage(fn: string): Promise<UsageResult> {
   const db = svc();
   const { data, error } = await db.rpc("increment_usage", { fn_name: fn });
   if (error) {
     console.error("usage rpc error", error.message);
-    return false;
+    return { error: error.message };
   }
-  return data !== -1;
+  if (data === -1) return { over_cap: true };
+  return { ok: true };
 }
 
 // ---------- source fetching ----------
@@ -275,10 +278,13 @@ Deno.serve(async (req: Request) => {
     authorize(req);
     if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
-    // daily cap check FIRST
-    const allowed = await tryIncrementUsage("run-skill");
-    if (!allowed) {
-      return json({ error: "Demo daily limit reached — showing the last digest", code: "daily_limit" }, 429);
+    // daily cap check FIRST — fail closed on error, 429 on over-cap
+    const usage = await tryIncrementUsage("run-skill");
+    if ("error" in usage) {
+      return json({ error: "Usage counter unavailable — cannot proceed safely" }, 503);
+    }
+    if ("over_cap" in usage) {
+      return json({ error: "Demo daily limit reached - Offline demo still works", code: "daily_limit" }, 429);
     }
 
     const { skill_id } = await req.json();
