@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Inter:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-paper-50 text-ink-900 dark:bg-paper-950 dark:text-paper-100 font-sans;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-paper-200 dark:border-paper-800 bg-white dark:bg-paper-900 shadow-sm;
+  }
+  .btn {
+    @apply inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-moss-600 text-white hover:bg-moss-700 dark:bg-moss-500 dark:hover:bg-moss-600;
+  }
+  .btn-secondary {
+    @apply btn border border-paper-300 dark:border-paper-700 text-ink-700 dark:text-paper-200 hover:bg-paper-100 dark:hover:bg-paper-800;
+  }
+  .btn-ghost {
+    @apply btn text-ink-600 dark:text-paper-300 hover:bg-paper-100 dark:hover:bg-paper-800;
+  }
+  .input {
+    @apply w-full rounded-lg border border-paper-300 dark:border-paper-700 bg-white dark:bg-paper-900 px-3 py-2 text-sm text-ink-900 dark:text-paper-100 placeholder-ink-400 focus:outline-none focus:ring-2 focus:ring-moss-500/40 focus:border-moss-500;
+  }
+  .badge {
+    @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+  .headline-serif {
+    @apply font-serif font-semibold tracking-tight leading-tight;
+  }
+}
+
+.digest-body p {
+  margin-bottom: 0.75rem;
+  line-height: 1.7;
+}
+
+.digest-body h2 {
+  @apply font-serif text-xl font-semibold mt-6 mb-3;
+}

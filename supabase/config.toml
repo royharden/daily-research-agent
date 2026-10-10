@@ -1,0 +1,9 @@
+# Morning Brief — edge function config
+# Both functions are public in this demo (no auth): verify_jwt = false so the
+# frontend's anon key and pg_net cron calls work without a user session.
+
+[functions.run-skill]
+verify_jwt = false
+
+[functions.write-digest]
+verify_jwt = false
