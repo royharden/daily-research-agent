@@ -3,6 +3,25 @@
 // and scalars. Not a general YAML parser.
 import type { SkillConfig, SkillSource } from "./types";
 
+// Mirrors the server-side bounds in supabase/functions/_shared/skill-config.ts.
+export const SKILL_LIMITS = { name: 120, markdown: 10_000, sources: 8, query: 200, url: 2048, caresAbout: 500, skip: 500, output: 1000 };
+const REDDIT_HOSTS = ["reddit.com", "www.reddit.com", "old.reddit.com"];
+
+function sourceUrlError(type: string, url: string): string | null {
+  if (url.length > SKILL_LIMITS.url) return `Source type ${type} url must be ${SKILL_LIMITS.url} characters or fewer`;
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return `Source type ${type} url is not a valid URL`;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return `Source type ${type} url must start with http:// or https://`;
+  if (type === "reddit" && !REDDIT_HOSTS.includes(u.hostname.toLowerCase().replace(/\.+$/, ""))) {
+    return "Source type reddit url must be on reddit.com, www.reddit.com or old.reddit.com";
+  }
+  return null;
+}
+
 export interface ParsedSkill {
   frontmatter: Record<string, unknown>;
   config: SkillConfig;
@@ -107,20 +126,26 @@ export function parseSkill(markdown: string): ParsedSkill {
           continue;
         }
         if (type === "rss" || type === "reddit") {
+          const urlError = obj.url ? sourceUrlError(type, obj.url) : null;
           if (!obj.url) errors.push(`Source type ${type} needs a url`);
+          else if (urlError) errors.push(urlError);
           else sources.push({ type, url: obj.url });
         } else {
           if (!obj.query) errors.push(`Source type ${type} needs a query`);
+          else if (obj.query.length > SKILL_LIMITS.query) errors.push(`Source type ${type} query must be ${SKILL_LIMITS.query} characters or fewer`);
           else sources.push({ type, query: obj.query });
         }
       }
     }
+    if (sources.length > SKILL_LIMITS.sources) errors.push(`sources: at most ${SKILL_LIMITS.sources} sources`);
   } else {
     errors.push("sources: must be a list (each - type: hn/rss/arxiv/reddit)");
   }
 
   const keep = Number(meta.keep ?? 6);
-  if (!Number.isFinite(keep) || keep < 1 || keep > 12) errors.push("keep: must be a number between 1 and 12");
+  if (!Number.isInteger(keep) || keep < 1 || keep > 12) errors.push("keep: must be a number between 1 and 12");
+  if (String(meta.name ?? "").length > SKILL_LIMITS.name) errors.push(`name: must be ${SKILL_LIMITS.name} characters or fewer`);
+  if (markdown.length > SKILL_LIMITS.markdown) errors.push(`Skill is too long (max ${SKILL_LIMITS.markdown.toLocaleString()} characters)`);
 
   const schedule = String(meta.schedule ?? "0 7 * * *");
   if (!isValidCron(schedule)) errors.push(`schedule: "${schedule}" is not a valid 5-field cron expression`);
@@ -142,6 +167,9 @@ export function parseSkill(markdown: string): ParsedSkill {
   }
   if (!cares) errors.push('Add a "## What I care about" section — Jev needs it');
   if (!output) errors.push('Add an "## Output" section — the writer uses it');
+  if (cares.length > SKILL_LIMITS.caresAbout) errors.push(`"What I care about" must be ${SKILL_LIMITS.caresAbout} characters or fewer`);
+  if (skip.length > SKILL_LIMITS.skip) errors.push(`"Skip" must be ${SKILL_LIMITS.skip} characters or fewer`);
+  if (output.length > SKILL_LIMITS.output) errors.push(`"Output" must be ${SKILL_LIMITS.output} characters or fewer`);
 
   return {
     frontmatter: meta,

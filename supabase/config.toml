@@ -2,9 +2,13 @@
 # verify_jwt is enabled on all functions. The frontend calls via
 # supabase.functions.invoke (which sends the anon key as Authorization
 # and apikey headers). pg_cron jobs send the same headers from app_config.
+# write-digest additionally requires the service-role key (run-skill only).
 
 [functions.run-skill]
 verify_jwt = true
 
 [functions.write-digest]
+verify_jwt = true
+
+[functions.save-skill]
 verify_jwt = true

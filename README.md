@@ -26,11 +26,11 @@ graph LR
 
 ## Rules & scope
 
-- **Read-only, polite fetching.** Only `GET` from public sources listed in the skill: RSS/Atom feeds, the Hacker News Algolia API (`https://hn.algolia.com/api/v1/search_by_date`), arXiv's API (`http://export.arxiv.org/api/query`), and Reddit public `.json` listings. No logins, no scraping behind paywalls, and no following arbitrary links beyond fetching an item's page `<title>`/meta description when a feed lacks a summary. Max 60 items per skill per run, 2 MB per response, 20 s per source.
-- **SSRF guard on every fetched URL:** http/https only; blocks localhost, private/link-local/CGNAT ranges, `169.254.169.254`, `.internal`/`.local`, and non-standard ports. Max 3 redirects, re-checked each hop.
+- **Read-only, polite fetching.** Only `GET` from public sources listed in the skill: RSS/Atom feeds, the Hacker News Algolia API (`https://hn.algolia.com/api/v1/search_by_date`), arXiv's API (`http://export.arxiv.org/api/query`), and Reddit public `.json` listings. No logins, no scraping behind paywalls, and no following arbitrary links beyond fetching an item's page `<title>`/meta description when a feed lacks a summary. Max 60 items per skill per run, max 20 outbound fetches per run (sources + item-page fallbacks), 2 MB per response (streamed and enforced), 20 s per source.
+- **SSRF guard on every fetched URL:** http/https only; trailing dots stripped; blocks localhost, metadata hosts, `.internal`/`.local`, single-label hosts, credentials in URLs and non-standard ports; blocks private, loopback, link-local, CGNAT, multicast/reserved IPv4 and every IPv6 address outside global unicast (incl. all `::ffff:` mapped, `fc00::/7`, `fe80::/10`, `::`). The hostname is resolved (A + AAAA) on every hop and rejected if any answer is private; DNS failure fails closed. Max 3 redirects, re-checked each hop. Reddit sources must be on `reddit.com` / `www.reddit.com` / `old.reddit.com`.
 - **Untrusted content.** Fetched text is wrapped as data in every Jev and LLM call; instruction-like text is flagged (never obeyed).
-- **Daily cap.** Each Edge Function counts calls in `usage_counters(fn, day, calls)` and stops at **200 calls per day**, returning a friendly 429 ("Demo daily limit reached — showing the last digest"). The cron run checks the cap first.
-- **Small deploys.** Exactly two Edge Functions (`run-skill`, `write-digest`).
+- **Daily cap.** Every paid upstream call is reserved in `usage_counters(fn, day, calls)` via the service-role-only `increment_usage_by` function, **200 per function per day** (override with the `DAILY_CALL_LIMIT` secret). Each Jev request — every batch and every retry — is counted right before it is sent; over the cap, Jev stops and the keyword fallback scores the rest. `write-digest` counts its single OpenAI call. Each run and each new skill is also counted. Counter errors fail closed (503); over the cap returns a friendly 429 ("Demo daily limit reached - Offline demo still works").
+- **Small deploys.** Three Edge Functions (`run-skill`, `write-digest`, `save-skill`), all with `verify_jwt = true`. `write-digest` only accepts the service-role key (it is an internal step of `run-skill`); `save-skill` validates skill config and source URLs before writing.
 - All keys stay server-side in Supabase Edge Function secrets. Nothing secret goes in the browser bundle.
 
 ## Why Jev?
@@ -48,9 +48,10 @@ supabase secrets set TYPESAFE_API_KEY=... OPENAI_API_KEY=... OPENAI_MODEL=gpt-6-
 create extension if not exists pg_cron;
 create extension if not exists pg_net;
 
-# 3. Deploy the two functions
+# 3. Deploy the functions
 supabase functions deploy run-skill
 supabase functions deploy write-digest
+supabase functions deploy save-skill
 
 # 4. Run the app
 npm install
@@ -69,6 +70,7 @@ Saving a skill with an edited schedule upserts a matching `pg_cron` job (managed
 | `OPENAI_API_KEY` | Edge secret | LLM digest writer |
 | `OPENAI_MODEL` | Edge secret | Writer model (default `gpt-6-luna`) |
 | `OPENAI_BASE_URL` | Edge secret | Optional OpenAI-compatible base URL |
+| `DAILY_CALL_LIMIT` | Edge secret | Optional daily cap per function (default 200) |
 
 `.env.example` lists only the two `VITE_` vars.
 
@@ -94,4 +96,4 @@ Saving a skill with an edited schedule upserts a matching `pg_cron` job (managed
 - **Batched Jev questions.** One HTTP call carries up to 10 items × 4 questions, namespaced `item{n}__{q}` — dramatically cheaper and faster than per-item requests.
 - **Template writer fallback.** If `OPENAI_API_KEY` is missing or the LLM output fails validation, a deterministic template digest is built from ranked titles, so a digest always publishes. Jev still runs live in mock mode.
 - **Citation enforcement.** Every digest bullet must cite one of the input URLs; code drops any bullet whose URL isn't in the input set.
-- **Permissive RLS by design.** The demo is a single public workspace with no sign-in, so policies allow anon read/write; nothing secret is stored in these tables.
+- **Read-only anon access.** The demo is a single public workspace with no sign-in: anon can read skills, runs, items and digests, but has no INSERT/UPDATE/DELETE. All writes go through Edge Functions using the service-role client with whitelisted columns and bounded payloads; `usage_counters` and `app_config` are not readable by anon at all.

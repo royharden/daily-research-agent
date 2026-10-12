@@ -1,7 +1,33 @@
 // write-digest: LLM summarizes kept items into a published digest.
-// verify_jwt = true — called by run-skill via the service-role client which sends auth headers.
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
-import { corsHeaders, json, DAILY_CAP, truncate, sanitizeUntrusted, nowIso } from "../_shared/deno-utils.ts";
+// verify_jwt = true — internal step: only run-skill (service-role client) may call it.
+import {
+  corsHeaders,
+  json,
+  DAILY_LIMIT_BODY,
+  HttpError,
+  UUID_RE,
+  MAX_RESPONSE_BYTES,
+  truncate,
+  sanitizeUntrusted,
+  isHttpUrl,
+  readJsonBody,
+  readTextBounded,
+  timingSafeEqual,
+} from "../_shared/deno-utils.ts";
+import { serviceClient, tryIncrementUsage } from "../_shared/usage.ts";
+
+const MAX_BODY_BYTES = 64 * 1024;
+const LLM_TIMEOUT_MS = 60_000;
+const LIMITS = {
+  skillName: 120,
+  outputInstructions: 1000,
+  items: 12,
+  title: 160,
+  url: 2048,
+  summary: 400,
+  source: 40,
+  kind: 40,
+};
 
 interface DigestItem {
   title: string;
@@ -18,23 +44,44 @@ interface DigestContent {
   themes: string[];
 }
 
-function svc() {
-  return createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+/** Only the service-role key (sent by run-skill's client) may call this function. */
+function isInternalCaller(req: Request): boolean {
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.get("authorization") ?? "");
+  return !!key && !!m && timingSafeEqual(m[1].trim(), key);
 }
 
-function authorize(_req: Request): void {
-  // Public demo function: no caller auth. Abuse is bounded by the daily cap
-  // and the read-only, SSRF-guarded fetcher.
+function optionalString(body: Record<string, unknown>, key: string, max: number, fallback = ""): string {
+  const v = body[key];
+  if (v == null) return fallback;
+  if (typeof v !== "string") throw new HttpError(422, `${key} must be a string`);
+  if (v.length > max) throw new HttpError(422, `${key} must be ${max} characters or fewer`);
+  return v;
 }
 
-type UsageResult = { ok: true } | { over_cap: true } | { error: string };
-
-async function tryIncrementUsage(): Promise<UsageResult> {
-  const db = svc();
-  const { data, error } = await db.rpc("increment_usage", { fn_name: "write-digest" });
-  if (error) return { error: error.message };
-  if (data === -1) return { over_cap: true };
-  return { ok: true };
+function validateItems(raw: unknown): DigestItem[] {
+  if (!Array.isArray(raw) || raw.length === 0) throw new HttpError(400, "skill_id and items required");
+  if (raw.length > LIMITS.items) throw new HttpError(422, `items: at most ${LIMITS.items}`);
+  return raw.map((r, i) => {
+    if (!r || typeof r !== "object" || Array.isArray(r)) throw new HttpError(422, `items[${i}] must be an object`);
+    const it = r as Record<string, unknown>;
+    const field = (key: keyof DigestItem, max: number, required: boolean): string => {
+      const v = it[key] ?? "";
+      if (typeof v !== "string") throw new HttpError(422, `items[${i}].${key} must be a string`);
+      if (required && !v) throw new HttpError(422, `items[${i}].${key} required`);
+      if (v.length > max) throw new HttpError(422, `items[${i}].${key} must be ${max} characters or fewer`);
+      return v;
+    };
+    const item: DigestItem = {
+      title: field("title", LIMITS.title, true),
+      url: field("url", LIMITS.url, true),
+      source: field("source", LIMITS.source, false),
+      summary: field("summary", LIMITS.summary, false),
+      kind: field("kind", LIMITS.kind, false),
+    };
+    if (!isHttpUrl(item.url, LIMITS.url)) throw new HttpError(422, `items[${i}].url must be an http(s) URL`);
+    return item;
+  });
 }
 
 function mockDigest(skillName: string, items: DigestItem[]): DigestContent {
@@ -68,6 +115,7 @@ function buildPrompt(skillName: string, outputInstructions: string, items: Diges
   };
 }
 
+/** Single OpenAI call (no retries) — already counted once against the daily cap by the handler. */
 async function callLLM(prompt: { system: string; user: string }): Promise<string> {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!apiKey) throw new Error("OPENAI_API_KEY not configured");
@@ -84,10 +132,15 @@ async function callLLM(prompt: { system: string; user: string }): Promise<string
       ],
       response_format: { type: "json_object" },
     }),
+    signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`LLM HTTP ${res.status}`);
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? "";
+  if (!res.ok) {
+    const detail = await readTextBounded(res, 2048, true).catch(() => "");
+    throw new Error(`LLM HTTP ${res.status}: ${detail}`);
+  }
+  const data = JSON.parse(await readTextBounded(res, MAX_RESPONSE_BYTES));
+  const content = data?.choices?.[0]?.message?.content;
+  return typeof content === "string" ? content : "";
 }
 
 function parseAndValidate(text: string, validUrls: Set<string>): DigestContent | null {
@@ -96,16 +149,19 @@ function parseAndValidate(text: string, validUrls: Set<string>): DigestContent |
     if (!raw.headline || !Array.isArray(raw.bullets)) return null;
     const bullets = raw.bullets
       .filter((b) => b && typeof b.text === "string" && validUrls.has(b.item_url))
-      .slice(0, 10);
+      .slice(0, 10)
+      .map((b) => ({ text: truncate(b.text, 1000), item_url: b.item_url }));
     let fullRead: DigestContent["full_read"] = null;
     if (raw.full_read && validUrls.has(raw.full_read.item_url)) {
-      fullRead = { item_url: raw.full_read.item_url, why: String(raw.full_read.why ?? "") };
+      fullRead = { item_url: raw.full_read.item_url, why: truncate(String(raw.full_read.why ?? ""), 1000) };
     }
     const fallbackUrl = bullets[0]?.item_url ?? (validUrls.size ? [...validUrls][0] : null);
     if (!fullRead && fallbackUrl) fullRead = { item_url: fallbackUrl, why: "Top-ranked item." };
-    const themes = Array.isArray(raw.themes) ? raw.themes.filter((t) => typeof t === "string").slice(0, 5) : [];
+    const themes = Array.isArray(raw.themes)
+      ? raw.themes.filter((t) => typeof t === "string").slice(0, 5).map((t) => truncate(t, 60))
+      : [];
     if (bullets.length === 0) return null;
-    return { headline: String(raw.headline), bullets, full_read: fullRead, themes };
+    return { headline: truncate(String(raw.headline), 300), bullets, full_read: fullRead, themes };
   } catch {
     return null;
   }
@@ -114,27 +170,37 @@ function parseAndValidate(text: string, validUrls: Set<string>): DigestContent |
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
   try {
-    authorize(req);
     if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
-    const usage = await tryIncrementUsage();
+    const db = serviceClient();
+    if (!db) return json({ error: "Service not configured" }, 503);
+    if (!isInternalCaller(req)) return json({ error: "Unauthorized" }, 401);
+
+    // bound and validate the request before any paid call or prompt building
+    const body = await readJsonBody(req, MAX_BODY_BYTES);
+    const runId = body.run_id;
+    const skillId = body.skill_id;
+    if (runId != null && (typeof runId !== "string" || !UUID_RE.test(runId))) {
+      return json({ error: "run_id must be a uuid" }, 400);
+    }
+    if (skillId != null && (typeof skillId !== "string" || !UUID_RE.test(skillId))) {
+      return json({ error: "skill_id must be a uuid" }, 400);
+    }
+    const items = validateItems(body.items);
+    if (!skillId) return json({ error: "skill_id and items required" }, 400);
+    const skillName = optionalString(body, "skill_name", LIMITS.skillName, "Morning Brief");
+    const outputInstructions = optionalString(body, "output_instructions", LIMITS.outputInstructions);
+    const writerMode: "llm" | "mock" = body.mock ? "mock" : "llm";
+
+    // daily cap: one unit per request covers the single OpenAI call below
+    const usage = await tryIncrementUsage(db, "write-digest");
     if ("error" in usage) {
       return json({ error: "Usage counter unavailable — cannot proceed safely" }, 503);
     }
     if ("over_cap" in usage) {
-      return json({ error: "Demo daily limit reached - Offline demo still works", code: "daily_limit" }, 429);
+      return json(DAILY_LIMIT_BODY, 429);
     }
 
-    const body = await req.json();
-    const runId: string | undefined = body.run_id;
-    const skillId: string | undefined = body.skill_id;
-    const skillName: string = body.skill_name ?? "Morning Brief";
-    const outputInstructions: string = String(body.output_instructions ?? "");
-    const writerMode: "llm" | "mock" = body.mock ? "mock" : "llm";
-    const items: DigestItem[] = Array.isArray(body.items) ? body.items.slice(0, 12) : [];
-    if (!skillId || items.length === 0) return json({ error: "skill_id and items required" }, 400);
-
-    const db = svc();
     const validUrls = new Set(items.map((i) => i.url));
 
     let content: DigestContent | null = null;
@@ -164,6 +230,8 @@ Deno.serve(async (req: Request) => {
 
     return json({ slug: digest.slug, content, writer_mode: mode });
   } catch (err) {
-    return json({ error: (err as Error).message }, 500);
+    if (err instanceof HttpError) return json({ error: err.message }, err.status);
+    console.error("write-digest error", (err as Error).message);
+    return json({ error: "Internal error" }, 500);
   }
 });

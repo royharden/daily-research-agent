@@ -1,47 +1,38 @@
 // run-skill: fetch sources -> dedupe -> Jev (batched) -> rank -> call write-digest.
 // verify_jwt = true — callers must send the anon key (frontend via supabase.functions.invoke, cron via Authorization header).
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 import {
   corsHeaders,
   json,
-  DAILY_CAP,
+  DAILY_LIMIT_BODY,
+  HttpError,
+  SafeError,
+  UUID_RE,
+  MAX_RESPONSE_BYTES,
   truncate,
   sanitizeUntrusted,
   safeFetch,
   checkUrl,
-  nextCronRun,
+  isHttpUrl,
+  readJsonBody,
+  readTextBounded,
   nowIso,
 } from "../_shared/deno-utils.ts";
+import { serviceClient, tryIncrementUsage } from "../_shared/usage.ts";
+import { boundConfigForRun, type SkillSource } from "../_shared/skill-config.ts";
 import { dedupeItems } from "../_shared/similarity.ts";
 import { rankAndKeep, type JevAnswers, type RankItem } from "../_shared/ranking.ts";
 
 const JEV_URL = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODEL = "jev-1.13.0";
 const JEV_COST_PER_MTOK = 0.042; // USD per 1M input tokens
+const JEV_MAX_ATTEMPTS = 2; // first try + one retry (429 / 529 / network error only)
+const JEV_TIMEOUT_MS = 30_000;
 const MAX_ITEMS = 60;
 const BATCH = 10;
-
-function svc() {
-  return createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
-}
-
-function authorize(_req: Request): void {
-  // Public demo function: no caller auth. Abuse is bounded by the daily cap
-  // and the read-only, SSRF-guarded fetcher.
-}
-
-type UsageResult = { ok: true } | { over_cap: true } | { error: string };
-
-async function tryIncrementUsage(fn: string): Promise<UsageResult> {
-  const db = svc();
-  const { data, error } = await db.rpc("increment_usage", { fn_name: fn });
-  if (error) {
-    console.error("usage rpc error", error.message);
-    return { error: error.message };
-  }
-  if (data === -1) return { over_cap: true };
-  return { ok: true };
-}
+const MAX_BODY_BYTES = 4 * 1024;
+const MAX_OUTBOUND_FETCHES = 20; // per run: sources + RSS item-page fallbacks
+const DIGEST_MAX_ITEMS = 12; // write-digest rejects more
 
 // ---------- source fetching ----------
 
@@ -52,18 +43,35 @@ interface RawItem {
   source: string; // e.g. "hn", "rss", "arxiv" (per-source label like "rss:<host>" allowed)
 }
 
-async function fetchSource(src: Record<string, unknown>): Promise<RawItem[]> {
-  const type = String(src.type ?? "");
+/** Per-run cap on outbound fetches. Sources are reserved up front so RSS fallbacks can't starve them. */
+class FetchBudget {
+  constructor(private remaining: number, private pendingSources: number) {}
+  takeSource(): boolean {
+    this.pendingSources = Math.max(0, this.pendingSources - 1);
+    if (this.remaining <= 0) return false;
+    this.remaining--;
+    return true;
+  }
+  takeFallback(): boolean {
+    if (this.remaining - this.pendingSources <= 0) return false;
+    this.remaining--;
+    return true;
+  }
+}
+
+async function fetchSource(src: SkillSource, budget: FetchBudget): Promise<RawItem[]> {
+  const type = src.type;
+  if (!budget.takeSource()) throw new SafeError(`outbound fetch limit reached (${MAX_OUTBOUND_FETCHES} per run)`);
   if (type === "hn") {
-    const query = String(src.query ?? "");
+    const query = src.query ?? "";
     const url = `https://hn.algolia.com/api/v1/search_by_date?query=${encodeURIComponent(query)}&tags=story&hitsPerPage=30`;
     const blocked = checkUrl(url);
-    if (blocked) throw new Error(`blocked source: ${blocked}`);
+    if (blocked) throw new SafeError(`blocked source: ${blocked}`);
     const res = await safeFetch(url);
-    if (!res.ok) throw new Error(`hn search failed (${res.status})`);
-    const data = await res.json();
-    return (data.hits ?? [])
-      .filter((h: Record<string, unknown>) => h.title)
+    if (!res.ok) throw new SafeError(`hn search failed (${res.status})`);
+    const data = (await res.json()) as { hits?: Record<string, unknown>[] } | null;
+    return (Array.isArray(data?.hits) ? data.hits : [])
+      .filter((h: Record<string, unknown>) => h && h.title)
       .map((h: Record<string, unknown>) => ({
         url: String(h.url || `https://news.ycombinator.com/item?id=${h.objectID}`),
         title: String(h.title),
@@ -74,12 +82,12 @@ async function fetchSource(src: Record<string, unknown>): Promise<RawItem[]> {
       }));
   }
   if (type === "arxiv") {
-    const query = String(src.query ?? "");
+    const query = src.query ?? "";
     const url = `http://export.arxiv.org/api/query?search_query=${encodeURIComponent(query)}&sortBy=submittedDate&sortOrder=descending&max_results=30`;
     const blocked = checkUrl(url);
-    if (blocked) throw new Error(`blocked source: ${blocked}`);
+    if (blocked) throw new SafeError(`blocked source: ${blocked}`);
     const res = await safeFetch(url);
-    if (!res.ok) throw new Error(`arxiv fetch failed (${res.status})`);
+    if (!res.ok) throw new SafeError(`arxiv fetch failed (${res.status})`);
     const xml = await res.text();
     const items: RawItem[] = [];
     const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
@@ -103,11 +111,10 @@ async function fetchSource(src: Record<string, unknown>): Promise<RawItem[]> {
     return items;
   }
   if (type === "rss") {
-    const feedUrl = String(src.url ?? "");
+    const feedUrl = src.url ?? "";
     const res = await safeFetch(feedUrl);
-    if (!res.ok) throw new Error(`rss fetch failed (${res.status})`);
+    if (!res.ok) throw new SafeError(`rss fetch failed (${res.status})`);
     const xml = await res.text();
-    if (xml.length > 2 * 1024 * 1024) throw new Error("feed larger than 2 MB");
     const items: RawItem[] = [];
     // RSS <item> and Atom <entry>
     const entryRe = /<(?:item|entry)[\s>]([\s\S]*?)<\/(?:item|entry)>/g;
@@ -126,10 +133,10 @@ async function fetchSource(src: Record<string, unknown>): Promise<RawItem[]> {
       }
       if (!title || !link || !/^https?:\/\//i.test(link)) continue;
       let summary = pick("description") || pick("summary") || pick("content");
-      if (!summary) {
-        // polite fallback: fetch the item page title only
+      // polite fallback: fetch the item page title only, within the per-run fetch budget
+      if (!summary && budget.takeFallback()) {
         try {
-          const page = await safeFetch(link, 10_000);
+          const page = await safeFetch(link, { timeoutMs: 10_000, maxBytes: 64 * 1024, truncate: true });
           const html = (await page.text()).slice(0, 20_000);
           const t = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1];
           if (t) summary = truncate(t.replace(/<[^>]+>/g, "").trim(), 200);
@@ -142,13 +149,14 @@ async function fetchSource(src: Record<string, unknown>): Promise<RawItem[]> {
     return items;
   }
   if (type === "reddit") {
-    const url0 = String(src.url ?? "");
+    const url0 = src.url ?? "";
     const res = await safeFetch(url0.endsWith(".json") ? url0 : url0.replace(/\/$/, "") + "/.json?limit=30");
-    if (!res.ok) throw new Error(`reddit fetch failed (${res.status})`);
-    const data = await res.json();
-    return (data?.data?.children ?? [])
+    if (!res.ok) throw new SafeError(`reddit fetch failed (${res.status})`);
+    const data = (await res.json()) as { data?: { children?: Record<string, unknown>[] } } | null;
+    const children = Array.isArray(data?.data?.children) ? data.data.children : [];
+    return children
       .map((c: Record<string, unknown>) => {
-        const d = c.data as Record<string, unknown>;
+        const d = (c?.data ?? {}) as Record<string, unknown>;
         return {
           url: String(d.url || `https://reddit.com${d.permalink}`),
           title: String(d.title ?? ""),
@@ -158,7 +166,7 @@ async function fetchSource(src: Record<string, unknown>): Promise<RawItem[]> {
       })
       .filter((i: RawItem) => i.title && i.url);
   }
-  throw new Error(`unknown source type: ${type}`);
+  throw new SafeError(`unknown source type: ${String(type).slice(0, 20)}`);
 }
 
 // ---------- Jev ----------
@@ -235,40 +243,68 @@ interface JevRawResult {
   probabilities?: Record<string, number>;
 }
 
-async function callJev(payload: JevPayload): Promise<{ answers: Record<string, JevRawResult>; usage: { input_tokens: number; output_tokens: number }; model: string; latency_ms: number }> {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * One Jev request. Every fetch (including the retry) is counted against the daily
+ * cap right before it goes out; over the cap or a counter failure throws and no
+ * further Jev calls are made. Retries only on 429 / 529 / network errors, max 2 attempts.
+ */
+async function callJev(db: SupabaseClient, payload: JevPayload): Promise<{ answers: Record<string, JevRawResult>; usage: { input_tokens: number; output_tokens: number }; model: string; latency_ms: number }> {
   const apiKey = Deno.env.get("TYPESAFE_API_KEY");
-  if (!apiKey) throw new Error("TYPESAFE_API_KEY not configured");
+  if (!apiKey) throw new SafeError("TYPESAFE_API_KEY not configured");
   const started = Date.now();
   let lastErr = "";
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < JEV_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) await sleep(500 * Math.pow(2, attempt - 1));
+    const usage = await tryIncrementUsage(db, "run-skill-jev");
+    if ("over_cap" in usage) throw new SafeError("daily limit reached");
+    if ("error" in usage) throw new SafeError("usage counter unavailable");
+    let res: Response;
     try {
-      const res = await fetch(JEV_URL, {
+      res = await fetch(JEV_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(JEV_TIMEOUT_MS),
       });
-      if (res.status === 429 || res.status === 529) {
-        lastErr = `HTTP ${res.status}`;
-        await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
-        continue;
-      }
-      if (!res.ok) throw new Error(`Jev HTTP ${res.status}`);
-      const data = await res.json();
-      return {
-        answers: data.answers ?? data,
-        usage: data.usage ?? { input_tokens: 0, output_tokens: 0 },
-        model: data.model ?? JEV_MODEL,
-        latency_ms: Date.now() - started,
-      };
     } catch (e) {
-      lastErr = (e as Error).message;
-      await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
+      console.error("Jev network error", (e as Error).message);
+      lastErr = "network error";
+      continue;
     }
+    if (res.status === 429 || res.status === 529) {
+      await res.body?.cancel().catch(() => {});
+      lastErr = `HTTP ${res.status}`;
+      continue;
+    }
+    if (!res.ok) {
+      const detail = await readTextBounded(res, 2048, true).catch(() => "");
+      console.error("Jev HTTP error", res.status, detail);
+      throw new SafeError(`HTTP ${res.status}`);
+    }
+    let data: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(await readTextBounded(res, MAX_RESPONSE_BYTES));
+      if (!parsed || typeof parsed !== "object") throw new Error("not an object");
+      data = parsed as Record<string, unknown>;
+    } catch (e) {
+      console.error("Jev invalid response", (e as Error).message);
+      throw new SafeError("invalid response");
+    }
+    const answers = (data.answers && typeof data.answers === "object" ? data.answers : data) as Record<string, JevRawResult>;
+    const u = (data.usage ?? {}) as Record<string, unknown>;
+    return {
+      answers,
+      usage: { input_tokens: Number(u.input_tokens) || 0, output_tokens: Number(u.output_tokens) || 0 },
+      model: typeof data.model === "string" ? data.model.slice(0, 64) : JEV_MODEL,
+      latency_ms: Date.now() - started,
+    };
   }
-  throw new Error(`Jev failed after retries: ${lastErr}`);
+  throw new SafeError(`failed after retries (${lastErr})`);
 }
 
 // ---------- handler ----------
@@ -276,32 +312,33 @@ async function callJev(payload: JevPayload): Promise<{ answers: Record<string, J
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
   try {
-    authorize(req);
     if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
-    // daily cap check FIRST — fail closed on error, 429 on over-cap
-    const usage = await tryIncrementUsage("run-skill");
+    const db = serviceClient();
+    if (!db) return json({ error: "Service not configured" }, 503);
+
+    const body = await readJsonBody(req, MAX_BODY_BYTES);
+    const skill_id = body.skill_id;
+    if (!skill_id) return json({ error: "skill_id required" }, 400);
+    if (typeof skill_id !== "string" || !UUID_RE.test(skill_id)) return json({ error: "skill_id must be a uuid" }, 400);
+
+    // daily cap check before any work — fail closed on error, 429 on over-cap
+    const usage = await tryIncrementUsage(db, "run-skill");
     if ("error" in usage) {
       return json({ error: "Usage counter unavailable — cannot proceed safely" }, 503);
     }
     if ("over_cap" in usage) {
-      return json({ error: "Demo daily limit reached - Offline demo still works", code: "daily_limit" }, 429);
+      return json(DAILY_LIMIT_BODY, 429);
     }
 
-    const { skill_id } = await req.json();
-    if (!skill_id) return json({ error: "skill_id required" }, 400);
-
     const runStart = Date.now();
-    const db = svc();
 
     const { data: skill, error: skillErr } = await db.from("skills").select("*").eq("id", skill_id).maybeSingle();
     if (skillErr || !skill) return json({ error: "skill not found" }, 404);
 
-    const config = skill.config as Record<string, unknown>;
-    const sources = Array.isArray(config.sources) ? (config.sources as Record<string, unknown>[]) : [];
-    const keep = Number(config.keep ?? 6);
-    const caresAbout = String(config.cares_about ?? "");
-    const skip = String(config.skip ?? "");
+    // config is user-authored: re-bound everything read from the DB
+    const config = boundConfigForRun(skill.config);
+    const { sources, keep, cares_about: caresAbout, skip } = config;
 
     // create run row
     const { data: run, error: runErr } = await db
@@ -328,13 +365,15 @@ Deno.serve(async (req: Request) => {
     try {
       // 1. fetch
       const raw: RawItem[] = [];
-      const fetchErrors: string[] = [];
-      for (const src of sources.slice(0, 8)) {
+      const fetchErrors: string[] = config.rejected.map((r) => `rejected source: ${r}`);
+      const budget = new FetchBudget(MAX_OUTBOUND_FETCHES, sources.length);
+      for (const src of sources) {
         try {
-          const items = await fetchSource(src);
-          raw.push(...items);
+          const items = await fetchSource(src, budget);
+          raw.push(...items.filter((it) => isHttpUrl(it.url)));
         } catch (e) {
-          fetchErrors.push(`${src.type}: ${(e as Error).message}`);
+          if (!(e instanceof SafeError)) console.error("source fetch error", src.type, (e as Error).message);
+          fetchErrors.push(`${src.type}: ${e instanceof SafeError ? e.message : "fetch failed"}`);
         }
       }
       const fetched = raw.slice(0, MAX_ITEMS);
@@ -363,7 +402,7 @@ Deno.serve(async (req: Request) => {
         .limit(500);
       const recentTitles = (recentKept ?? []).map((r: { title: string }) => r.title);
 
-      // 3. Jev in batches of 10
+      // 3. Jev in batches of 10 — each Jev fetch is counted; on cap/error the rest use the keyword fallback
       const answers = new Map<string, JevAnswers>();
       let totalInputTokens = 0;
       let jevModel = JEV_MODEL;
@@ -374,8 +413,8 @@ Deno.serve(async (req: Request) => {
           for (let i = 0; i < fresh.length; i += BATCH) {
             const batch = fresh.slice(i, i + BATCH);
             const payload = buildBatchPayload(batch, caresAbout, skip);
-            const { answers: rawAnswers, usage, model, latency_ms } = await callJev(payload);
-            totalInputTokens += usage.input_tokens ?? 0;
+            const { answers: rawAnswers, usage, model, latency_ms } = await callJev(db, payload);
+            totalInputTokens += usage.input_tokens;
             jevModel = model;
             jevLatency = Math.max(jevLatency, latency_ms);
             batch.forEach((it, idx) => {
@@ -391,14 +430,15 @@ Deno.serve(async (req: Request) => {
                 relevance: rel && typeof rel.score === "number" ? rel.score : 0,
                 substance: sub && typeof sub.score === "number" ? sub.score : 0,
                 skip_p: skipP,
-                kind: kd && typeof kd.choice === "string" ? kd.choice : "uncertain",
+                kind: kd && typeof kd.choice === "string" ? kd.choice.slice(0, 40) : "uncertain",
                 jev: true,
               });
             });
           }
         } catch (e) {
           // keyword fallback, labeled
-          jevError = `Jev unreachable: ${(e as Error).message}. Used fallback.`;
+          if (!(e instanceof SafeError)) console.error("Jev step error", (e as Error).message);
+          jevError = `Jev unreachable: ${e instanceof SafeError ? e.message : "unexpected error"}. Used fallback.`;
           for (const it of fresh) {
             if (!answers.has(it.url)) {
               const fb = keywordFallbackLocal(it, caresAbout, skip);
@@ -443,21 +483,28 @@ Deno.serve(async (req: Request) => {
 
       const keptItems = candidates.filter((c) => c.kept);
 
+      // write-digest accepts at most 12 items: keep the 12 best-scored, in their original order
+      let digestItems = keptItems;
+      if (digestItems.length > DIGEST_MAX_ITEMS) {
+        const top = new Set([...digestItems].sort((a, b) => b.score - a.score).slice(0, DIGEST_MAX_ITEMS));
+        digestItems = digestItems.filter((c) => top.has(c));
+      }
+
       // 5. digest
       let digestSlug: string | null = null;
-      if (keptItems.length > 0) {
+      if (digestItems.length > 0) {
         const digestRes = await db.functions.invoke("write-digest", {
           body: {
             run_id: run.id,
             skill_id: skill.id,
-            skill_name: skill.name,
-            output_instructions: config.output ?? "",
-            items: keptItems.map((c) => ({
-              title: c.item.title,
+            skill_name: truncate(String(skill.name ?? ""), 120),
+            output_instructions: config.output,
+            items: digestItems.map((c) => ({
+              title: truncate(c.item.title, 160),
               url: c.item.url,
-              source: c.item.source,
+              source: c.item.source.slice(0, 40),
               summary: truncate(c.item.summary, 400),
-              kind: c.answers.kind,
+              kind: String(c.answers.kind ?? "").slice(0, 40),
             })),
           },
         });
@@ -483,14 +530,14 @@ Deno.serve(async (req: Request) => {
         fetch_errors: fetchErrors,
       });
     } catch (e) {
-      const msg = (e as Error).message;
-      await finish("error", {}, 0, msg);
-      return json({ error: msg }, 500);
+      console.error("run-skill pipeline error", (e as Error).message);
+      await finish("error", {}, 0, "Run failed");
+      return json({ error: "Run failed", run_id: run.id }, 500);
     }
   } catch (err) {
-    const msg = (err as Error).message;
-    const status = msg.includes("limit") ? 429 : msg.includes("apikey") || msg.includes("Invalid") ? 401 : 500;
-    return json({ error: msg }, status);
+    if (err instanceof HttpError) return json({ error: err.message }, err.status);
+    console.error("run-skill error", (err as Error).message);
+    return json({ error: "Internal error" }, 500);
   }
 });
 

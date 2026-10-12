@@ -4,6 +4,7 @@ import { Clock, PauseCircle, PlayCircle, Plus, Save, AlertTriangle, CheckCircle2
 import { useSkills, useLatestRun } from "@/hooks/useData";
 import { parseSkill, isValidCron } from "@/lib/frontmatter";
 import { supabase } from "@/lib/supabase";
+import { saveSkill } from "@/lib/skillsApi";
 import { nextCronRun } from "@/lib/cron";
 import type { Skill } from "@/lib/types";
 
@@ -50,13 +51,8 @@ export default function SkillsPage() {
         <button
           className="btn-primary"
           onClick={async () => {
-            const slug = `skill-${Date.now().toString(36)}`;
-            const { data } = await supabase
-              .from("skills")
-              .insert({ slug, name: "Untitled skill", markdown: TEMPLATE, config: { sources: [], keep: 6, cares_about: "", skip: "", output: "" }, schedule: "0 7 * * *", active: false })
-              .select()
-              .maybeSingle();
-            if (data) setSelectedId((data as Skill).id);
+            const { data } = await saveSkill<{ skill: Skill }>({ action: "create", markdown: TEMPLATE });
+            if (data?.skill) setSelectedId(data.skill.id);
           }}
         >
           <Plus size={16} /> New skill
@@ -82,7 +78,7 @@ function SkillRow({ skill, open, onToggle }: { skill: Skill; open: boolean; onTo
   const parsed = useMemo(() => parseSkill(skill.markdown), [skill.markdown]);
 
   const setPaused = async (paused: boolean) => {
-    await supabase.from("skills").update({ active: !paused }).eq("id", skill.id);
+    await saveSkill({ action: "set_active", id: skill.id, active: !paused });
     window.location.reload();
   };
 
@@ -148,21 +144,26 @@ function Editor({ skill }: { skill: Skill }) {
   const [markdown, setMarkdown] = useState(skill.markdown);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [preview, setPreview] = useState<"edit" | "preview">("edit");
   const parsed = useMemo(() => parseSkill(markdown), [markdown]);
 
   const save = async () => {
     setSaving(true);
-    await supabase
-      .from("skills")
-      .update({
-        markdown,
-        name: String(parsed.frontmatter.name ?? skill.name),
-        schedule: String(parsed.frontmatter.schedule ?? skill.schedule),
-        config: parsed.config,
-      })
-      .eq("id", skill.id);
+    setSaveError(null);
+    const { error } = await saveSkill({
+      action: "update",
+      id: skill.id,
+      markdown,
+      name: String(parsed.frontmatter.name ?? skill.name),
+      schedule: String(parsed.frontmatter.schedule ?? skill.schedule),
+      config: parsed.config,
+    });
     setSaving(false);
+    if (error) {
+      setSaveError(error);
+      return;
+    }
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -200,6 +201,12 @@ function Editor({ skill }: { skill: Skill }) {
       ) : (
         <div className="mb-3 flex items-center gap-2 text-xs text-moss-600 dark:text-moss-300">
           <CheckCircle2 size={13} /> Front-matter looks good — {parsed.config.sources.length} sources, keep {parsed.config.keep}
+        </div>
+      )}
+
+      {saveError && (
+        <div className="mb-3 flex items-start gap-2 text-xs text-red-600">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" /> {saveError}
         </div>
       )}
 
