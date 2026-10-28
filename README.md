@@ -97,3 +97,17 @@ Saving a skill with an edited schedule upserts a matching `pg_cron` job (managed
 - **Template writer fallback.** If `OPENAI_API_KEY` is missing or the LLM output fails validation, a deterministic template digest is built from ranked titles, so a digest always publishes. Jev still runs live in mock mode.
 - **Citation enforcement.** Every digest bullet must cite one of the input URLs; code drops any bullet whose URL isn't in the input set.
 - **Read-only anon access.** The demo is a single public workspace with no sign-in: anon can read skills, runs, items and digests, but has no INSERT/UPDATE/DELETE. All writes go through Edge Functions using the service-role client with whitelisted columns and bounded payloads; `usage_counters` and `app_config` are not readable by anon at all.
+
+## Scheduling configuration
+
+Migrations contain no project token. Supply app.settings.supabase_url and
+app.settings.anon_key in the migration session through your deployment tooling,
+or populate the owner-only public.app_config rows supabase_url and anon_key
+in the SQL editor using values from your own project. Never paste those values
+into tracked SQL. The browser separately reads the two public VITE_ variables.
+Missing migration settings leave existing configuration unchanged; configure both
+rows before enabling schedules. This change does not reconfigure a deployed project.
+
+Earlier Git revisions contained public anon-role tokens. Existing history is
+retained; replacing the current source does not revoke those tokens. Project owners
+should review exposure and key rotation in their deployment separately.
