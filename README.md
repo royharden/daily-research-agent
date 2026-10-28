@@ -90,13 +90,30 @@ Saving a skill with an edited schedule upserts a matching `pg_cron` job (managed
 - Cron parsing supports the common 5-field subset (`*`, lists, ranges, steps).
 - The 200 calls/day cap is per function per calendar day (UTC), shared by all demo visitors.
 
+## Deferred security work
+
+This repository is a public demo with one shared workspace. The migrations allow
+anonymous reads of every row in `skills`, `runs`, `items`, and `digests`, including
+their configuration, errors, responses, and content. Keep private or sensitive data
+out of these tables until the access model is changed.
+
+The `save-skill` Edge Function uses a service-role client and does not check the
+caller's identity or ownership before updating or activating a skill. The anonymous
+key can invoke it, so direct table write restrictions do not prevent anonymous
+changes through that function. Before using this beyond a public demo, the next team
+should define the intended access model, add authentication and per-skill
+authorization to privileged operations, and restrict table read policies accordingly.
+Verify the deployed migrations, grants, policies, and function configuration as well
+as testing allowed and denied access; repository migrations alone do not establish
+the live project's state. This work is deferred and has not been implemented.
+
 ## Design decisions
 
 - **Ranking in code, not in the model.** The score formula (`relevance/4 × 0.55 + substance/4 × 0.35 + novelty × 0.10`, times `(1 − skip_p)`) lives in plain TypeScript so it's inspectable, deterministic, and unit-test friendly. Jev judges; code decides.
 - **Batched Jev questions.** One HTTP call carries up to 10 items × 4 questions, namespaced `item{n}__{q}` — dramatically cheaper and faster than per-item requests.
 - **Template writer fallback.** If `OPENAI_API_KEY` is missing or the LLM output fails validation, a deterministic template digest is built from ranked titles, so a digest always publishes. Jev still runs live in mock mode.
 - **Citation enforcement.** Every digest bullet must cite one of the input URLs; code drops any bullet whose URL isn't in the input set.
-- **Read-only anon access.** The demo is a single public workspace with no sign-in: anon can read skills, runs, items and digests, but has no INSERT/UPDATE/DELETE. All writes go through Edge Functions using the service-role client with whitelisted columns and bounded payloads; `usage_counters` and `app_config` are not readable by anon at all.
+- **Direct table access.** The demo is a single public workspace with no sign-in: anon can read skills, runs, items and digests, but the migrations remove direct INSERT/UPDATE/DELETE access. Writes go through Edge Functions using the service-role client with whitelisted columns and bounded payloads; `usage_counters` and `app_config` are not readable by anon under the migrations. See Deferred security work for the missing caller authorization on `save-skill`.
 
 ## Scheduling configuration
 
