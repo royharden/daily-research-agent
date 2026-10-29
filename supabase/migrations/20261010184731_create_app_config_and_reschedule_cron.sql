@@ -5,8 +5,8 @@
 - Creates a small `app_config` table to hold the project URL and anon key
   for use by pg_cron jobs (since ALTER DATABASE SET app.settings.* is not
   permitted on this platform).
-- The URL and anon key are public values (the anon key ships in the browser
-  bundle for this no-auth demo). They are NOT secrets.
+- Deployment-specific values are supplied by the operator, never committed.
+  The anon role is public, but its project token must not be baked into source.
 - RLS enabled with no policies — only the service_role / postgres roles
   can read it; anon and authenticated get nothing.
 - Reschedules the three cron jobs to read from app_config at runtime.
@@ -24,9 +24,14 @@ CREATE TABLE IF NOT EXISTS app_config (
 
 ALTER TABLE app_config ENABLE ROW LEVEL SECURITY;
 
-INSERT INTO app_config (key, value) VALUES
-  ('supabase_url', 'https://delmjlsyujwzytvsqwcr.supabase.co'),
-  ('anon_key', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRlbG1qbHN5dWp3enl0dnNxd2NyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1OTI1NDIsImV4cCI6MjEwNzE2ODU0Mn0.tJ3Q6Up5rCEm2f_KQOXJ3WzkFUKB8s-3uQba39IZ4QA')
+-- Optional migration-session settings, supplied outside this repository. Missing
+-- settings preserve existing configuration and do not store placeholder values.
+INSERT INTO app_config (key, value)
+SELECT key, value FROM (VALUES
+  ('supabase_url', nullif(current_setting('app.settings.supabase_url', true), '')),
+  ('anon_key', nullif(current_setting('app.settings.anon_key', true), ''))
+) AS config(key, value)
+WHERE value IS NOT NULL
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 DO $$
